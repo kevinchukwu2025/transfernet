@@ -9,44 +9,58 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  timeout: 30000,
 });
 
 export const uploadFile = async (file, onProgress) => {
+  // Use larger chunks now since we're uploading directly to R2 (no Vercel limit!)
   const CHUNK_SIZE = 50 * 1024 * 1024; // 50MB chunks
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
   try {
-    // Step 1: Initialize upload
+    // Step 1: Initialize upload and get presigned URLs
     const initResponse = await api.post('/api/upload/init', {
       fileName: file.name,
       fileSize: file.size,
       totalChunks,
     });
 
-    const { fileId } = initResponse.data;
+    const { fileId, presignedUrls } = initResponse.data;
 
-    // Step 2: Upload chunks in parallel (3 at a time for optimal speed)
-    const uploadPromises = [];
-    const maxParallel = 3;
-
+    // Step 2: Upload chunks directly to R2 using presigned URLs
     for (let i = 0; i < totalChunks; i++) {
       const start = i * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const chunk = file.slice(start, end);
 
-      const uploadChunk = async () => {
-        const formData = new FormData();
-        formData.append('chunk', chunk);
-        formData.append('fileId', fileId);
-        formData.append('chunkIndex', i);
-        formData.append('totalChunks', totalChunks);
-        formData.append('fileName', file.name);
-        formData.append('fileSize', file.size);
+      const presignedUrl = presignedUrls[i].url;
 
-        const response = await api.post('/api/upload/chunk', formData, {
+      try {
+        // Upload directly to R2 using presigned URL (bypasses our backend!)
+        await axios.put(presignedUrl, chunk, {
           headers: {
-            'Content-Type': 'multipart/form-data',
+            'Content-Type': 'application/octet-stream',
           },
+          timeout: 120000, // 2 minutes per chunk
+          onUploadProgress: (progressEvent) => {
+            // Calculate overall progress
+            const chunkProgress = progressEvent.loaded / progressEvent.total;
+            const overallProgress = ((i + chunkProgress) / totalChunks) * 100;
+            
+            if (onProgress) {
+              onProgress({
+                progress: overallProgress,
+                uploadedChunks: i,
+                totalChunks,
+              });
+            }
+          },
+        });
+
+        // Notify backend that chunk was uploaded
+        await api.post('/api/upload/chunk-complete', {
+          fileId,
+          chunkIndex: i,
         });
 
         // Update progress
@@ -58,24 +72,37 @@ export const uploadFile = async (file, onProgress) => {
             totalChunks,
           });
         }
+      } catch (chunkError) {
+        console.error(`Failed to upload chunk ${i}:`, chunkError);
+        
+        // Retry once
+        console.log(`Retrying chunk ${i}...`);
+        try {
+          await axios.put(presignedUrl, chunk, {
+            headers: {
+              'Content-Type': 'application/octet-stream',
+            },
+            timeout: 120000,
+          });
 
-        return response.data;
-      };
+          await api.post('/api/upload/chunk-complete', {
+            fileId,
+            chunkIndex: i,
+          });
 
-      uploadPromises.push(uploadChunk());
-
-      // Wait if we've reached max parallel uploads
-      if (uploadPromises.length >= maxParallel) {
-        await Promise.race(uploadPromises);
-        uploadPromises.splice(
-          uploadPromises.findIndex((p) => p !== undefined),
-          1
-        );
+          if (onProgress) {
+            const progress = ((i + 1) / totalChunks) * 100;
+            onProgress({
+              progress,
+              uploadedChunks: i + 1,
+              totalChunks,
+            });
+          }
+        } catch (retryError) {
+          throw new Error(`Failed to upload chunk ${i + 1} of ${totalChunks}. Please try again.`);
+        }
       }
     }
-
-    // Wait for all remaining chunks
-    await Promise.all(uploadPromises);
 
     // Step 3: Complete upload and get download link
     const completeResponse = await api.post('/api/upload/complete', {
@@ -90,7 +117,25 @@ export const uploadFile = async (file, onProgress) => {
     };
   } catch (error) {
     console.error('Upload error:', error);
-    throw new Error(error.response?.data?.error || 'Upload failed');
+    
+    if (error.response) {
+      const status = error.response.status;
+      const message = error.response.data?.error || error.message;
+      
+      if (status === 413) {
+        throw new Error('File chunk too large. Please contact support.');
+      } else if (status === 403) {
+        throw new Error('Upload forbidden. Please check your connection.');
+      } else if (status === 500) {
+        throw new Error('Server error. Please try again later.');
+      } else {
+        throw new Error(message);
+      }
+    } else if (error.request) {
+      throw new Error('Network error. Please check your internet connection.');
+    } else {
+      throw new Error(error.message || 'Upload failed. Please try again.');
+    }
   }
 };
 
@@ -100,7 +145,14 @@ export const getFileInfo = async (fileId) => {
     return response.data;
   } catch (error) {
     console.error('Get file info error:', error);
-    throw new Error(error.response?.data?.error || 'Failed to get file info');
+    
+    if (error.response?.status === 404) {
+      throw new Error('File not found or has expired');
+    } else if (error.response?.status === 410) {
+      throw new Error('File has expired');
+    } else {
+      throw new Error(error.response?.data?.error || 'Failed to get file info');
+    }
   }
 };
 
@@ -114,20 +166,42 @@ export const downloadFile = async (fileId, fileName, onProgress) => {
     const chunks = [];
     
     for (let i = 0; i < totalChunks; i++) {
-      const response = await api.get(`/api/download/${fileId}/chunk/${i}`, {
-        responseType: 'blob',
-      });
-
-      chunks.push(response.data);
-
-      // Update progress
-      if (onProgress) {
-        const progress = ((i + 1) / totalChunks) * 100;
-        onProgress({
-          progress,
-          downloadedChunks: i + 1,
-          totalChunks,
+      try {
+        const response = await api.get(`/api/download/${fileId}/chunk/${i}`, {
+          responseType: 'blob',
+          timeout: 120000,
         });
+
+        chunks.push(response.data);
+
+        if (onProgress) {
+          const progress = ((i + 1) / totalChunks) * 100;
+          onProgress({
+            progress,
+            downloadedChunks: i + 1,
+            totalChunks,
+          });
+        }
+      } catch (chunkError) {
+        console.error(`Failed to download chunk ${i}:`, chunkError);
+        
+        // Retry once
+        console.log(`Retrying chunk ${i} download...`);
+        const response = await api.get(`/api/download/${fileId}/chunk/${i}`, {
+          responseType: 'blob',
+          timeout: 120000,
+        });
+
+        chunks.push(response.data);
+
+        if (onProgress) {
+          const progress = ((i + 1) / totalChunks) * 100;
+          onProgress({
+            progress,
+            downloadedChunks: i + 1,
+            totalChunks,
+          });
+        }
       }
     }
 
@@ -147,7 +221,14 @@ export const downloadFile = async (fileId, fileName, onProgress) => {
     return { success: true };
   } catch (error) {
     console.error('Download error:', error);
-    throw new Error(error.response?.data?.error || 'Download failed');
+    
+    if (error.message.includes('expired')) {
+      throw new Error('File has expired');
+    } else if (error.message.includes('not found')) {
+      throw new Error('File not found');
+    } else {
+      throw new Error(error.response?.data?.error || 'Download failed. Please try again.');
+    }
   }
 };
 
